@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 ServiceName = Literal["gateway", "auth", "order", "cache"]
 Outcome = Literal["healthy", "root_cause_found", "needs_retest"]
 BatchStatus = Literal["running", "completed", "interrupted", "failed"]
+EventType = Literal["fault", "root_cause_changed", "recovered"]
 
 
 class FaultPatch(BaseModel):
@@ -85,6 +86,13 @@ class StateResponse(BaseModel):
     watcher_running: bool
     watcher_interval_seconds: float
     service_states: list[MockState]
+    notified_root_causes: list[str] = Field(
+        default_factory=list,
+        description="Root-cause services the duty system was last notified about.",
+    )
+    events_emitted: int = Field(
+        default=0, description="Total incident events emitted so far."
+    )
 
 
 class ProbeEvidence(BaseModel):
@@ -199,6 +207,62 @@ class BatchList(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     state_version: int
+
+
+class IncidentEvent(BaseModel):
+    """One immutable incident-change notification.
+
+    Emitted exactly once, when a completed, credible, non-superseded diagnosis
+    batch changes the notified root-cause set. ``event_id`` is the
+    subscription cursor: it is strictly increasing and the record behind it
+    never changes, so a subscriber can always resume with
+    ``GET /events?cursor=<last seen event_id>``.
+    """
+
+    event_id: int = Field(description="Monotonic cursor; pass as ?cursor= to resume.")
+    event_type: EventType = Field(
+        description=(
+            "fault: incident opened; root_cause_changed: same incident, new "
+            "root-cause set; recovered: incident closed (all healthy)."
+        )
+    )
+    batch_id: str = Field(description="Source diagnosis batch.")
+    batch_seq: int = Field(description="Sequence number of the source batch.")
+    state_version: int = Field(
+        description="Global state version the source batch diagnosed."
+    )
+    root_causes: list[RootCause] = Field(
+        default_factory=list,
+        description="Root causes now in effect (empty for recovered).",
+    )
+    previous_root_causes: list[str] = Field(
+        default_factory=list,
+        description="Root-cause services notified before this event.",
+    )
+    primary_root_cause: str | None = None
+    summary: str
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="Evidence summary lines carried over from the source batch.",
+    )
+    notified_root_causes: list[str] = Field(
+        default_factory=list,
+        description="Notified root-cause set in effect after this event.",
+    )
+    created_at: str
+
+
+class EventList(BaseModel):
+    events: list[IncidentEvent]
+    next_cursor: int = Field(
+        description="Pass this as ?cursor= on the next poll to continue the feed."
+    )
+    latest_event_id: int = Field(
+        description=(
+            "Highest event id assigned so far; next_cursor == latest_event_id "
+            "means the subscriber is fully caught up."
+        )
+    )
 
 
 class ErrorResponse(BaseModel):

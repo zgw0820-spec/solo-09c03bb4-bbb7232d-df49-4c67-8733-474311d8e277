@@ -17,6 +17,13 @@ Ordering guarantees:
   relabelled. A late response therefore stays auditable yet can never become
   ``GET /diagnosis/latest``.
 * ``state_version`` is persisted so a restart never reissues a used version.
+
+Incident events: when a batch finishes, ``Store.finish_batch`` decides (from
+the batch's status, superseded flag and verdict, plus the persisted notified
+root-cause set) whether an incident event is emitted, and commits the batch
+record, the event and the notified marker in one SQLite transaction. A late
+(superseded) or unsure (``needs_retest``) batch emits nothing, so the feed a
+duty subscriber reads never rolls back and never cries wolf.
 """
 from __future__ import annotations
 
@@ -459,6 +466,24 @@ class Coordinator:
 
     def list_batches(self, limit: int) -> list[dict[str, Any]]:
         return [self._enrich(record) for record in self.store.list_batches(limit)]
+
+    # -- incident events -------------------------------------------------
+    def list_events(self, cursor: int, limit: int) -> dict[str, Any]:
+        """One cursor page of the immutable incident-event feed."""
+        events = self.store.list_events(cursor=cursor, limit=limit)
+        latest = self.store.latest_event_id()
+        next_cursor = events[-1]["event_id"] if events else max(0, int(cursor))
+        return {
+            "events": events,
+            "next_cursor": next_cursor,
+            "latest_event_id": latest,
+        }
+
+    def notified_root_causes(self) -> list[str]:
+        return self.store.notified_root_causes()
+
+    def events_emitted(self) -> int:
+        return self.store.count_events()
 
     def _enrich(self, record: dict[str, Any] | None) -> dict[str, Any] | None:
         if record is None:

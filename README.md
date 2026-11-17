@@ -4,6 +4,8 @@
 **订单（order）**，还是**鉴权与订单共用的缓存（cache）**。
 
 - 诊断 API：FastAPI + SQLite，Swagger 见 `http://localhost:8000/docs`
+- 事故事件 API：`GET /events` 按游标输出故障 / 根因变化 / 恢复事件，供机房值班
+  系统只在事故变化时通知值班员
 - 四个模拟服务：可由 API 设置本地故障（liveness / readiness / 探测延迟），
   并提供 `/health/live`、`/health/ready`、`/admin/*` 探测与管理接口
 - 拓扑：`gateway -> {auth, order}`，`auth -> cache`，`order -> cache`
@@ -30,7 +32,12 @@ curl -s -X POST 'http://localhost:8000/diagnosis?wait=true' | jq '
    independent_faults_count: .result.independent_faults_count,
    affected: .result.affected_services}'
 
-# 4) 清空故障
+# 4) 值班系统按游标读取事故变化（fault / root_cause_changed / recovered）
+curl -s 'http://localhost:8000/events?cursor=0&limit=50' | jq '
+  {events: [.events[] | {event_id, event_type, root_causes: [.root_causes[].service]}],
+   next_cursor}'
+
+# 5) 清空故障
 curl -s -X POST http://localhost:8000/faults/reset | jq .
 ```
 
@@ -54,9 +61,10 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
 | `GET` | `/diagnosis/{batch_id}` | 单个批次结果；未完成的批次返回 `running` |
 | `GET` | `/diagnosis/latest` | 最新批次（默认包含未完成批次；`?completed_only=true` 只看有结论的批次） |
 | `GET` | `/diagnosis?limit=` | 最近批次列表 |
+| `GET` | `/events?cursor=&limit=` | 事故事件流（游标分页）：`fault` / `root_cause_changed` / `recovered` |
 | `PUT` | `/faults/{service}` | 设置 `live_ok` / `ready_ok` / `probe_delay_ms`，**递增全局状态版号** |
 | `POST` | `/faults/reset` | 清空所有本地故障，**递增全局状态版号** |
-| `GET` | `/state` | 全局状态版号、批次序号、各服务采用的版号与配置轮次 |
+| `GET` | `/state` | 全局状态版号、批次序号、各服务采用的版号与配置轮次、已通知根因集合 |
 | `GET` | `/topology` | 依赖拓扑 |
 | `GET` | `/health` | 诊断 API 自身存活 |
 
@@ -113,6 +121,26 @@ DIAG_DB_PATH=/tmp/diagnosis.db python -m uvicorn app.main:app --port 8000 &
   `GET /diagnosis/latest` 按 `seq` 取最新，因此旧批次永不覆盖新结论。
 - 互不相关的更早批次不会被追溯标记，只有真正「迟到」的批次才带该标记。
 
+### 事故事件（值班通知）
+
+`GET /events` 是给机房值班系统的事故变化订阅流，只在**事故状态变化**时产生事件：
+
+- **产生条件**：只有「最新（未被 superseded）且证据可信（`healthy` /
+  `root_cause_found`）的完成批次」才能产生事件。`needs_retest` 不产生事件，
+  尤其**不算恢复**；迟到的旧批次（superseded）不产生事件，**不能回退**已通知状态。
+- **事件类型**：`fault`（事故开始：根因集合由空变非空）、
+  `root_cause_changed`（事故未结束但根因集合改变）、`recovered`（根因集合清空）。
+  根因集合不变时不重复通知——同一故障持续期间，重复诊断只产生一条 `fault`。
+- **事件内容**：来源批次（`batch_id` / `batch_seq`）、状态版号、当前根因、
+  之前的已通知根因、证据摘要与结论摘要。
+- **游标订阅**：`event_id` 单调递增即游标。事件只增不改，分页返回的内容一经
+  发出永不改变；订阅端保存 `next_cursor`，下次以 `?cursor=` 接续，
+  `next_cursor == latest_event_id` 表示已追平。
+- **原子落库**：批次完成、事件产生、已通知根因集合的推进在同一个 SQLite
+  事务中提交；并发诊断下事件按批次序号顺序产生，进程重启（含 `kill -9`）后
+  订阅端按游标接续，不漏不重。`GET /state` 同时暴露当前已通知根因集合
+  （`notified_root_causes`）与累计事件数（`events_emitted`）。
+
 ### 重启
 
 - 已完成批次写入 SQLite，重启后可继续查询（`GET /diagnosis/{id}`、
@@ -144,12 +172,14 @@ app/
   services/       各服务的 uvicorn 入口
   probes.py       HTTP 探测与证据归一化
   diagnosis.py    纯函数归约：根因 / 受牵连 / 待重测
+  events.py       纯函数事件决策：故障 / 根因变化 / 恢复
   coordinator.py  状态版号、故障注入、批次调度、重启恢复、外部故障监视
-  store.py        SQLite 持久化
+  store.py        SQLite 持久化（批次 + 事故事件，同事务提交）
   models.py       Pydantic 模型（驱动 OpenAPI）
   main.py         FastAPI 应用
 tests/
   test_reduction.py  归约逻辑单元测试（14）
+  test_events.py     事件决策、落库原子性与端到端事件流测试（12）
   test_api.py        真实 uvicorn 进程端到端测试（19）
 ```
 
@@ -163,7 +193,9 @@ python -m pytest -q
 测试用随机端口启动 4 个模拟服务与诊断 API 的真实进程，覆盖：健康、四类故障、
 缓存故障去重、双独立故障、超时、版号混杂、依赖检查超时、并发探测、异步批次与
 迟到响应、等待预算到期返回 202 后轮询、重启恢复、版号冲突、Swagger/OpenAPI、
-未知服务。
+未知服务；事故事件覆盖：故障/根因变化/恢复的事件序列、根因不变不重复通知、
+待重测不算恢复、迟到批次不回退、并发诊断只产生一条事件、游标分页与事件不可变、
+重启后按游标接续。
 
 ## 已知限制
 

@@ -15,6 +15,7 @@ from .models import (
     BatchSummary,
     DiagnosisBatch,
     ErrorResponse,
+    EventList,
     FaultPatch,
     FaultSetResponse,
     HealthResponse,
@@ -43,6 +44,13 @@ Locate which layer caused an entry-service outage: **gateway (entry)**,
 * Batches are persisted in SQLite: completed results survive a restart,
   unfinished ones are reported as `needs_retest`. A late response from an old
   batch is flagged `superseded` and never overrides the newest result.
+* `GET /events` is the incident change feed for the duty-rota system: a
+  completed, credible, non-superseded batch emits `fault` /
+  `root_cause_changed` / `recovered` exactly when the notified root-cause set
+  changes. `needs_retest` never counts as a recovery, and a late batch never
+  rolls the feed back. Events are immutable and read by cursor
+  (`?cursor=<last event_id>&limit=`), so subscribers resume after restarts
+  without missing or duplicating a notification.
 """
 
 
@@ -68,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         openapi_tags=[
             {"name": "diagnosis", "description": "Run diagnoses and read results"},
+            {"name": "events", "description": "Incident change feed for the duty system"},
             {"name": "faults", "description": "Inject and clear local faults"},
             {"name": "state", "description": "State version, topology and service state"},
             {"name": "health", "description": "Liveness of this API"},
@@ -107,6 +116,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "watcher_running": coord._watcher_task is not None,
             "watcher_interval_seconds": request.app.state.settings.watcher_interval_seconds,
             "service_states": states,
+            "notified_root_causes": coord.notified_root_causes(),
+            "events_emitted": coord.events_emitted(),
         }
 
     @app.get(
@@ -328,6 +339,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail={"error": "batch_not_found", "batch_id": batch_id},
             )
         return record
+
+    # -- incident events -------------------------------------------------
+    @app.get(
+        "/events",
+        response_model=EventList,
+        tags=["events"],
+        summary="Incident change feed, paged by cursor",
+        description=(
+            "Returns incident events with `event_id > cursor`, oldest first. "
+            "An event is emitted only when a completed, credible, "
+            "non-superseded diagnosis batch changes the notified root-cause "
+            "set: `fault` (incident opened), `root_cause_changed` (same "
+            "incident, new root causes) or `recovered` (all healthy again). "
+            "`needs_retest` batches emit nothing and never count as a "
+            "recovery; superseded late batches never roll the feed back. "
+            "Events are immutable once issued: store `next_cursor` and pass "
+            "it as `cursor` on the next poll to resume without missing or "
+            "repeating a notification, even across API restarts."
+        ),
+    )
+    async def list_events(
+        request: Request,
+        cursor: int = Query(
+            default=0,
+            ge=0,
+            description="Return events after this event id (0 = from the beginning).",
+        ),
+        limit: int = Query(
+            default=50, ge=1, le=500, description="Maximum events per page."
+        ),
+    ) -> dict[str, Any]:
+        return request.app.state.coordinator.list_events(cursor, limit)
 
     return app
 
